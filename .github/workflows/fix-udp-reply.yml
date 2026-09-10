@@ -1,0 +1,40 @@
+name: Fix UDP reply buffer
+
+on:
+  push:
+    branches: ["feat/windows-native-v4"]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: ${{ !contains(github.event.head_commit.message, '[skip udp fix]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix UDP send_to type
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src-tauri/src/lib.rs')
+          s = p.read_text(encoding='utf-8')
+          old = 'let _=socket.send_to(reply,addr);'
+          new = 'let _=socket.send_to(reply.as_bytes(),addr);'
+          if old not in s:
+              print('No UDP reply fix needed')
+          else:
+              p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+      - name: Commit fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/src/lib.rs
+          git commit -m "fix: send UDP reply as bytes [skip udp fix]"
+          git push
