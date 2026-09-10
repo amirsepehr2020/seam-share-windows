@@ -25,7 +25,6 @@ fn persist_pairing(state:&AppState)->Result<(),String>{let mut settings=load_set
 fn safe_segment(v:&str)->String{v.chars().filter(|c|c.is_alphanumeric()||matches!(c,'.'|'_'|'-'|' ')).collect::<String>().trim().to_string()}
 fn safe_relative(v:&str)->PathBuf{v.replace("\\","/").split('/').filter_map(|s|{let x=safe_segment(s);if x.is_empty()||x=="."||x==".."{None}else{Some(x)}}).collect()}
 fn header(h:&[(String,String)],k:&str)->Option<String>{h.iter().find(|(a,_)|a==k).map(|(_,b)|b.clone())}
-fn emit_paired(app:&AppHandle,state:&AppState){if let Ok(list)=state.paired.lock(){let out:list::Vec<PairedDeviceInfo>=list.iter().map(|p|PairedDeviceInfo{device_id:p.device_id.clone(),name:p.device_name.clone(),ip:p.ip.clone(),port:p.port,token:p.token.clone()}).collect();let _=app.emit("paired-devices-updated",out);}}
 #[command] fn network_info()->Result<NetworkInfo,String>{Ok(NetworkInfo{local_ip:local_ip()?.to_string(),discovery_port:DISCOVERY_PORT,transfer_port:TRANSFER_PORT})}
 #[command] fn pairing_info(state:tauri::State<AppState>)->Result<PairingInfo,String>{Ok(PairingInfo{device_id:state.device_id.clone(),device_name:state.device_name.clone(),ip:local_ip()?.to_string(),port:TRANSFER_PORT,token:state.token.clone()})}
 #[command] fn paired_devices(state:tauri::State<AppState>)->Result<Vec<PairedDeviceInfo>,String>{Ok(state.paired.lock().map_err(|_|"pairing state unavailable".to_string())?.iter().map(|p|PairedDeviceInfo{device_id:p.device_id.clone(),name:p.device_name.clone(),ip:p.ip.clone(),port:p.port,token:p.token.clone()}).collect())}
