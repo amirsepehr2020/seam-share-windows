@@ -1,0 +1,30 @@
+name: SEAM Share Windows build
+on:
+  push:
+    branches: ["feat/windows-native-v4"]
+  workflow_dispatch:
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+      - name: Install dependencies
+        run: npm install
+      - name: Generate app icons
+        run: npm run tauri icon assets/seam-share-logo.svg
+      - name: Build installers
+        run: npm run tauri build
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: SEAM-Share-Windows-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
