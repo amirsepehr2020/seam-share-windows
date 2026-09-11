@@ -14,12 +14,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable-x86_64-pc-windows-msvc
-      - name: Run E2E conformance tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
       - name: Install dependencies
         run: npm install
       - name: Generate app icons
         run: npm run tauri icon assets/seam-share-logo.svg
+      - name: Run E2E conformance tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
       - name: Build installers
         run: npm run tauri build
       - name: Upload installers
