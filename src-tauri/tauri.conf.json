@@ -39,6 +39,10 @@
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "./windows/hooks.nsh"
       }
     },
     "shortDescription": "Fast private file transfer between Android and Windows",
