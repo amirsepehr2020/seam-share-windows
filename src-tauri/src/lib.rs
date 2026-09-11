@@ -1,62 +1,397 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, io::{Read, Write}, net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket}, path::{Path, PathBuf}, sync::{Arc, Mutex}, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tauri::{command, AppHandle, Emitter, Manager, WindowEvent};
-use tauri::{menu::{MenuBuilder, MenuItemBuilder}, tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
+
 mod seam_e2e;
 mod seam_e2e_protocol;
-const DISCOVERY_PORT:u16=38947; const TRANSFER_PORT:u16=38948; const MAGIC:&str="SEAM_SHARE_DISCOVER_V2"; const CHUNK:usize=256*1024;
-#[derive(Debug,Serialize,Clone)] pub struct NetworkInfo{pub local_ip:String,pub discovery_port:u16,pub transfer_port:u16}
-#[derive(Debug,Serialize,Clone)] pub struct NearbyDevice{pub name:String,pub ip:String,pub port:u16}
-#[derive(Debug,Serialize,Deserialize,Clone)] pub struct PairRequest{pub device_id:String,pub device_name:String,pub ip:String,pub port:u16,pub token:String}
-#[derive(Debug,Serialize,Clone)] pub struct PairingInfo{pub device_id:String,pub device_name:String,pub ip:String,pub port:u16,pub token:String}
-#[derive(Debug,Serialize,Clone)] pub struct PairedDeviceInfo{pub device_id:String,pub name:String,pub ip:String,pub port:u16,pub token:String}
-#[derive(Debug,Serialize,Clone)] pub struct TransferProgress{pub id:String,pub name:String,pub sent:u64,pub total:u64,pub progress:u8,pub state:String}
-#[derive(Debug,Serialize,Deserialize,Clone)] pub struct IncomingTransfer{pub id:String,pub name:String,pub size:u64,pub relative_path:String,pub checksum_sha256:String,#[serde(default)]pub e2e_version:Option<u32>,#[serde(default)]pub sender_ephemeral_public_key:Option<String>,#[serde(default)]pub nonce_prefix:Option<String>}
-#[derive(Debug,Serialize,Deserialize,Clone)] struct PairedDevice{device_id:String,device_name:String,ip:String,port:u16,token:String}
-#[derive(Debug,Serialize,Deserialize,Default)] struct Settings{receive_dir:Option<String>,#[serde(default)]paired:Vec<PairedDevice>}
-struct PendingE2e{key:[u8;32],nonce_prefix:[u8;4]}
-#[derive(Clone)] struct AppState{device_id:String,device_name:String,token:String,paired:Arc<Mutex<Vec<PairedDevice>>>,cancel:Arc<Mutex<Vec<String>>>,receive_dir:Arc<Mutex<PathBuf>>,pending:Arc<Mutex<HashMap<String,Option<bool>>>>,pending_e2e:Arc<Mutex<HashMap<String,PendingE2e>>>}
-fn local_ip()->Result<IpAddr,String>{local_ip_address::local_ip().map_err(|e|e.to_string())}
-fn make_id()->String{format!("seam-{:x}",SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos())}
-fn default_receive_dir()->PathBuf{let mut p=PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_|".".into()));p.push("Downloads");p.push("SEAM Share");p}
-fn settings_path()->PathBuf{let mut p=PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_|".".into()));p.push("SEAM Share");p.push("settings.json");p}
-fn load_settings()->Settings{fs::read_to_string(settings_path()).ok().and_then(|s|serde_json::from_str(&s).ok()).unwrap_or_default()}
-fn load_receive_dir()->PathBuf{load_settings().receive_dir.map(PathBuf::from).unwrap_or_else(default_receive_dir)}
-fn save_settings(s:&Settings)->Result<(),String>{let p=settings_path();if let Some(parent)=p.parent(){fs::create_dir_all(parent).map_err(|e|e.to_string())?}fs::write(p,serde_json::to_string_pretty(s).map_err(|e|e.to_string())?).map_err(|e|e.to_string())}
-fn save_receive_dir(p:&PathBuf)->Result<(),String>{let mut s=load_settings();s.receive_dir=Some(p.to_string_lossy().into_owned());save_settings(&s)}
-fn persist_pairing(state:&AppState)->Result<(),String>{let mut s=load_settings();s.paired=state.paired.lock().map_err(|_|"pairing state unavailable".to_string())?.clone();save_settings(&s)}
-fn safe_segment(v:&str)->String{v.chars().filter(|c|c.is_alphanumeric()||matches!(c,'.'|'_'|'-'|' ')).collect::<String>().trim().to_string()}
-fn safe_relative(v:&str)->PathBuf{v.replace('\\',"/").split('/').filter_map(|s|{let x=safe_segment(s);if x.is_empty()||x=="."||x==".."{None}else{Some(x)}}).collect()}
-fn header(h:&[(String,String)],k:&str)->Option<String>{h.iter().find(|(a,_)|a==k).map(|(_,b)|b.clone())}
-fn hex_encode(v:&[u8])->String{v.iter().map(|b|format!("{:02x}",b)).collect()}
-fn hex_decode(v:&str,size:usize)->Result<Vec<u8>,String>{if v.len()!=size*2{return Err("invalid hex length".into())}let mut o=Vec::with_capacity(size);for i in 0..size{o.push(u8::from_str_radix(&v[i*2..i*2+2],16).map_err(|_|"invalid hex".to_string())?)}Ok(o)}
-fn sha256_file(p:&Path)->Result<String,String>{let mut f=fs::File::open(p).map_err(|e|e.to_string())?;let mut h=Sha256::new();let mut b=[0u8;CHUNK];loop{let n=f.read(&mut b).map_err(|e|e.to_string())?;if n==0{break}h.update(&b[..n]);}Ok(format!("{:x}",h.finalize()))}
-#[command] fn network_info()->Result<NetworkInfo,String>{Ok(NetworkInfo{local_ip:local_ip()?.to_string(),discovery_port:DISCOVERY_PORT,transfer_port:TRANSFER_PORT})}
-#[command] fn pairing_info(state:tauri::State<AppState>)->Result<PairingInfo,String>{Ok(PairingInfo{device_id:state.device_id.clone(),device_name:state.device_name.clone(),ip:local_ip()?.to_string(),port:TRANSFER_PORT,token:state.token.clone()})}
-#[command] fn paired_devices(state:tauri::State<AppState>)->Result<Vec<PairedDeviceInfo>,String>{Ok(state.paired.lock().map_err(|_|"pairing state unavailable".to_string())?.iter().map(|p|PairedDeviceInfo{device_id:p.device_id.clone(),name:p.device_name.clone(),ip:p.ip.clone(),port:p.port,token:p.token.clone()}).collect())}
-#[command] fn receive_directory(state:tauri::State<AppState>)->Result<String,String>{Ok(state.receive_dir.lock().map_err(|_|"settings unavailable".to_string())?.to_string_lossy().into_owned())}
-#[command] fn set_receive_directory(path:String,state:tauri::State<AppState>)->Result<String,String>{let p=PathBuf::from(path);if !p.is_absolute(){return Err("Please choose an absolute folder path".into())}fs::create_dir_all(&p).map_err(|e|e.to_string())?;save_receive_dir(&p)?;*state.receive_dir.lock().map_err(|_|"settings unavailable".to_string())?=p.clone();Ok(p.to_string_lossy().into_owned())}
-#[command] fn discover_devices(device_name:String,timeout_ms:u64)->Result<Vec<NearbyDevice>,String>{let socket=UdpSocket::bind((Ipv4Addr::UNSPECIFIED,0)).map_err(|e|e.to_string())?;socket.set_broadcast(true).map_err(|e|e.to_string())?;socket.set_read_timeout(Some(Duration::from_millis(150))).map_err(|e|e.to_string())?;let msg=format!("{}|{}|{}",MAGIC,device_name,TRANSFER_PORT);socket.send_to(msg.as_bytes(),(Ipv4Addr::BROADCAST,DISCOVERY_PORT)).map_err(|e|e.to_string())?;let deadline=Instant::now()+Duration::from_millis(timeout_ms.clamp(300,3000));let mut found=Vec::new();let mut buf=[0u8;1024];while Instant::now()<deadline{if let Ok((len,addr))=socket.recv_from(&mut buf){let p:Vec<&str>=String::from_utf8_lossy(&buf[..len]).split('|').collect();if p.len()==3&&p[0]==MAGIC{if let Ok(port)=p[2].parse(){found.push(NearbyDevice{name:p[1].into(),ip:addr.ip().to_string(),port})}}}}found.sort_by(|a,b|a.ip.cmp(&b.ip));found.dedup_by(|a,b|a.ip==b.ip);Ok(found)}
-fn run_discovery_responder(name:String){if let Ok(socket)=UdpSocket::bind((Ipv4Addr::UNSPECIFIED,DISCOVERY_PORT)){let mut buf=[0u8;1024];loop{if let Ok((len,addr))=socket.recv_from(&mut buf){let p:Vec<&str>=String::from_utf8_lossy(&buf[..len]).split('|').collect();if p.len()>=3&&p[0]==MAGIC{let reply=format!("{}|{}|{}",MAGIC,name,TRANSFER_PORT);let _=socket.send_to(reply.as_bytes(),addr)}}}}}
-fn auto_discovery(app:AppHandle,state:AppState){loop{thread::sleep(Duration::from_secs(5));let devices=discover_devices(state.device_name.clone(),900).unwrap_or_default();if let Ok(mut paired)=state.paired.lock(){let mut changed=false;for d in devices{if let Some(p)=paired.iter_mut().find(|p|p.device_name==d.name){if p.ip!=d.ip||p.port!=d.port{p.ip=d.ip;p.port=d.port;changed=true}}}if changed{let _=persist_pairing(&state);let out:Vec<PairedDeviceInfo>=paired.iter().map(|p|PairedDeviceInfo{device_id:p.device_id.clone(),name:p.device_name.clone(),ip:p.ip.clone(),port:p.port,token:p.token.clone()}).collect();let _=app.emit("paired-devices-updated",out)}}}}
-fn read_headers(stream:&mut TcpStream)->Result<(String,Vec<(String,String)>,Vec<u8>),String>{let mut data=Vec::new();let mut buf=[0u8;4096];loop{let n=stream.read(&mut buf).map_err(|e|e.to_string())?;if n==0{return Err("connection closed".into())}data.extend_from_slice(&buf[..n]);if let Some(pos)=data.windows(4).position(|w|w==b"\r\n\r\n"){let text=String::from_utf8_lossy(&data[..pos+4]);let mut lines=text.split("\r\n");let request=lines.next().unwrap_or_default().to_string();let headers=lines.filter_map(|l|l.split_once(':')).map(|(k,v)|(k.trim().to_ascii_lowercase(),v.trim().to_string())).collect();return Ok((request,headers,data[pos+4..].to_vec()))}if data.len()>64*1024{return Err("headers too large".into())}}}
-fn respond(s:&mut TcpStream,code:u16,body:&str){let reason=match code{200=>"OK",201=>"Created",400=>"Bad Request",401=>"Unauthorized",403=>"Forbidden",422=>"Unprocessable Entity",_=>"Error"};let _=write!(s,"HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",code,reason,body.len(),body)}
-fn wait_approval(state:&AppState,app:&AppHandle,req:IncomingTransfer)->bool{if let Ok(mut p)=state.pending.lock(){p.insert(req.id.clone(),None)}let _=app.emit("incoming-transfer",req.clone());for _ in 0..240{thread::sleep(Duration::from_millis(500));if let Ok(mut p)=state.pending.lock(){if let Some(Some(v))=p.get(&req.id){let v=*v;p.remove(&req.id);return v}}}if let Ok(mut p)=state.pending.lock(){p.remove(&req.id)}false}
-fn read_response(s:&mut TcpStream)->Result<String,String>{let mut data=Vec::new();let mut b=[0u8;4096];for _ in 0..8{let n=s.read(&mut b).map_err(|e|e.to_string())?;if n==0{break}data.extend_from_slice(&b[..n]);if data.windows(4).any(|w|w==b"\r\n\r\n"){break}}Ok(String::from_utf8_lossy(&data).into_owned())}
-fn read_n(s:&mut TcpStream,initial:&mut Vec<u8>,n:usize)->Result<Vec<u8>,String>{let mut out=Vec::with_capacity(n);let take=initial.len().min(n);out.extend_from_slice(&initial[..take]);initial.drain(..take);while out.len()<n{let mut b=[0u8;64*1024];let want=(n-out.len()).min(b.len());let got=s.read(&mut b[..want]).map_err(|e|e.to_string())?;if got==0{return Err("connection closed during transfer".into())}out.extend_from_slice(&b[..got])}Ok(out)}
-fn transfer_server(state:AppState,app:AppHandle){let listener=match TcpListener::bind((Ipv4Addr::UNSPECIFIED,TRANSFER_PORT)){Ok(v)=>v,Err(_)=>return};for incoming in listener.incoming(){if let Ok(mut stream)=incoming{let s=state.clone();let a=app.clone();thread::spawn(move||{let(request,headers,mut body)=match read_headers(&mut stream){Ok(v)=>v,Err(_)=>return};if header(&headers,"x-seam-token").unwrap_or_default()!=s.token{respond(&mut stream,401,"");return}
-if request.starts_with("POST /pair "){if let Ok(text)=String::from_utf8(body){if let Ok(pair)=serde_json::from_str::<PairRequest>(&text){if let Ok(mut list)=s.paired.lock(){list.retain(|p|p.device_id!=pair.device_id);list.push(PairedDevice{device_id:pair.device_id,device_name:pair.device_name,ip:pair.ip,port:pair.port,token:pair.token})}let _=persist_pairing(&s);respond(&mut stream,200,"{}");return}}respond(&mut stream,400,"");return}
-if request.starts_with("POST /request "){if let Ok(text)=String::from_utf8(body){if let Ok(req)=serde_json::from_str::<IncomingTransfer>(&text){let mut e2e_response="{}".to_string();if req.e2e_version==Some(seam_e2e_protocol::VERSION)&&req.sender_ephemeral_public_key.is_some()&&req.nonce_prefix.is_some(){if let (Ok(peer),Ok(prefix))=(hex_decode(req.sender_ephemeral_public_key.as_ref().unwrap(),32),hex_decode(req.nonce_prefix.as_ref().unwrap(),4)){let kp=seam_e2e::generate_keypair();let peer_arr:[u8;32]=peer.try_into().map_err(|_|()).unwrap();let key=seam_e2e::derive_shared_key(&kp.private_key,&peer_arr);let prefix_arr:[u8;4]=prefix.try_into().map_err(|_|()).unwrap();if let Ok(mut m)=s.pending_e2e.lock(){m.insert(req.id.clone(),PendingE2e{key,nonce_prefix:prefix_arr});}e2e_response=serde_json::json!({"e2e_version":1,"receiver_ephemeral_public_key":hex_encode(&kp.public_key)}).to_string()}}
-if wait_approval(&s,&a,req.clone()){respond(&mut stream,200,&e2e_response)}else{let _=s.pending_e2e.lock().map(|mut m|m.remove(&req.id));respond(&mut stream,403,"DECLINED")}return}}respond(&mut stream,400,"");return}
-if request.starts_with("POST /receive-e2e "){let id=header(&headers,"x-seam-transfer-id").unwrap_or_default();let crypto=match s.pending_e2e.lock().ok().and_then(|mut m|m.remove(&id)){Some(v)=>v,None=>{respond(&mut stream,403,"missing e2e session");return}};let plain_size=match header(&headers,"x-plaintext-size").and_then(|v|v.parse::<u64>().ok()){Some(v)=>v,None=>{respond(&mut stream,400,"invalid plaintext size");return}};let encrypted_size=seam_e2e_protocol::ciphertext_size(plain_size);let content_length=header(&headers,"content-length").and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);if content_length!=encrypted_size{respond(&mut stream,400,"invalid encrypted size");return}let expected=header(&headers,"x-checksum-sha256").unwrap_or_default().to_ascii_lowercase();if expected.len()!=64||!expected.bytes().all(|b|b.is_ascii_hexdigit()){respond(&mut stream,400,"invalid checksum");return}let name=percent_decode(&header(&headers,"x-file-name").unwrap_or_else(||"received-file".into()));let relative=header(&headers,"x-relative-path").map(|v|percent_decode(&v)).unwrap_or(name.clone());let mut path=s.receive_dir.lock().map(|p|p.clone()).unwrap_or_else(|_|default_receive_dir());let rel=safe_relative(&relative);path.push(&rel);if rel.components().count()==0{respond(&mut stream,400,"");return}if let Some(parent)=path.parent(){let _=fs::create_dir_all(parent)}if let Ok(mut file)=fs::File::create(&path){let mut hasher=Sha256::new();let mut remaining=plain_size;let mut index=0u64;let mut ok=true;while remaining>0||index==0{let plain_len=if remaining==0{0}else{std::cmp::min(CHUNK as u64,remaining) as usize};let cipher=match read_n(&mut stream,&mut body,plain_len+seam_e2e_protocol::TAG_SIZE){Ok(v)=>v,Err(_)=>{ok=false;break}};let nonce=seam_e2e::chunk_nonce(&crypto.nonce_prefix,index);let aad=seam_e2e_protocol::aad(&id,index,plain_len);match seam_e2e::decrypt(&crypto.key,&nonce,&cipher,&aad){Ok(plain)=>{if plain.len()!=plain_len||file.write_all(&plain).is_err(){ok=false;break}hasher.update(&plain);remaining-=plain_len},Err(_)=>{ok=false;break}}index+=1}if !ok||remaining!=0{let _=fs::remove_file(&path);respond(&mut stream,422,"E2E authentication failed");return}let actual=format!("{:x}",hasher.finalize());if actual!=expected{let _=fs::remove_file(&path);let _=a.emit("transfer-verify-failed",serde_json::json!({"name":name,"expected":expected,"actual":actual}));respond(&mut stream,422,"checksum mismatch");return}let _=a.emit("transfer-verified",serde_json::json!({"name":name,"checksum":actual}));respond(&mut stream,201,"VERIFIED");return}else{respond(&mut stream,500,"unable to create output");return}}
-if request.starts_with("POST /receive "){respond(&mut stream,400,"legacy plaintext receive disabled; use E2E");return}
-respond(&mut stream,404,"")});}}}
-fn percent_decode(v:&str)->String{let mut out=Vec::with_capacity(v.len());let b=v.as_bytes();let mut i=0;while i<b.len(){if b[i]==b'%'&&i+2<b.len(){if let Ok(x)=u8::from_str_radix(&v[i+1..i+3],16){out.push(x);i+=3;continue}}if b[i]==b'+'{out.push(b' ')}else{out.push(b[i])}i+=1}String::from_utf8_lossy(&out).into_owned()}
-fn percent_encode(v:&str)->String{let mut s=String::new();for b in v.as_bytes(){if b.is_ascii_alphanumeric()||matches!(*b,b'.'|b'_'|b'-'|b'/'){s.push(*b as char)}else{use std::fmt::Write;write!(&mut s,"%{:02X}",b).ok()}}s}
-#[command] fn approve_incoming(id:String,approved:bool,state:tauri::State<AppState>)->Result<(),String>{let mut p=state.pending.lock().map_err(|_|"approval state unavailable".to_string())?;if let Some(v)=p.get_mut(&id){*v=Some(approved);Ok(())}else{Err("transfer request expired".into())}}
-#[command] fn list_files(path:String)->Result<Vec<(String,u64)>,String>{fn walk(root:&Path,dir:&Path,out:&mut Vec<(String,u64)>)->std::io::Result<()>{for e in fs::read_dir(dir)?{let e=e?;let p=e.path();if p.is_dir(){walk(root,&p,out)?}else if p.is_file(){if let Ok(rel)=p.strip_prefix(root){out.push((rel.to_string_lossy().into_owned(),e.metadata()?.len()))}}}Ok(())}let root=PathBuf::from(path);if !root.is_dir(){return Err("Not a folder".into())}let mut out=Vec::new();walk(&root,&root,&mut out).map_err(|e|e.to_string())?;Ok(out)}
-#[command] fn cancel_transfer(id:String,state:tauri::State<AppState>)->Result<(),String>{if let Ok(mut c)=state.cancel.lock(){if !c.contains(&id){c.push(id)}}Ok(())}
-#[command] fn send_file(app:AppHandle,state:tauri::State<AppState>,path:String,ip:String,port:u16,token:String,id:String,relative_path:Option<String>)->Result<(),String>{let total=fs::metadata(&path).map_err(|e|e.to_string())?.len();let name=PathBuf::from(&path).file_name().and_then(|v|v.to_str()).unwrap_or("shared-file").to_string();let rel=relative_path.unwrap_or_else(||name.clone());let checksum=sha256_file(Path::new(&path))?;let sender=seam_e2e::generate_keypair();let mut prefix=[0u8;4];getrandom::fill(&mut prefix).map_err(|e|e.to_string())?;let addr=format!("{}:{}",ip,port);let mut stream=TcpStream::connect(&addr).map_err(|e|e.to_string())?;stream.set_read_timeout(Some(Duration::from_secs(125))).ok();let req=IncomingTransfer{id:id.clone(),name:name.clone(),size:total,relative_path:rel.clone(),checksum_sha256:checksum.clone(),e2e_version:Some(seam_e2e_protocol::VERSION),sender_ephemeral_public_key:Some(hex_encode(&sender.public_key)),nonce_prefix:Some(hex_encode(&prefix))};let body=serde_json::to_string(&req).map_err(|e|e.to_string())?;let head=format!("POST /request HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Seam-Token: {}\r\nConnection: close\r\n\r\n{}",addr,body.len(),token,body);stream.write_all(head.as_bytes()).map_err(|e|e.to_string())?;let response=read_response(&mut stream)?;if !response.contains(" 200 "){return Err("Transfer declined".into())}let response_body=response.split("\r\n\r\n").nth(1).unwrap_or("");let value:serde_json::Value=serde_json::from_str(response_body).map_err(|_|"Receiver returned invalid E2E response".to_string())?;let receiver_pub=hex_decode(value.get("receiver_ephemeral_public_key").and_then(|v|v.as_str()).ok_or("Receiver did not return E2E key")?,32)?;let receiver_arr:[u8;32]=receiver_pub.try_into().map_err(|_|"invalid receiver key")?;let key=seam_e2e::derive_shared_key(&sender.private_key,&receiver_arr);drop(stream);let mut stream=TcpStream::connect(&addr).map_err(|e|e.to_string())?;let encrypted_total=seam_e2e_protocol::ciphertext_size(total);let enc=percent_encode(&rel);let head=format!("POST /receive-e2e HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nX-Seam-Token: {}\r\nX-Seam-Transfer-Id: {}\r\nX-File-Name: {}\r\nX-Relative-Path: {}\r\nX-Checksum-SHA256: {}\r\nX-Plaintext-Size: {}\r\nConnection: close\r\n\r\n",addr,encrypted_total,token,id,enc,enc,checksum,total);stream.write_all(head.as_bytes()).map_err(|e|e.to_string())?;let mut file=fs::File::open(&path).map_err(|e|e.to_string())?;let mut buf=[0u8;CHUNK];let mut sent=0u64;let mut index=0u64;loop{if state.cancel.lock().map(|c|c.contains(&id)).unwrap_or(false){let _=app.emit("transfer-progress",TransferProgress{id:id.clone(),name:name.clone(),sent,total,progress:((sent*100)/total.max(1)) as u8,state:"cancelled".into()});return Ok(())}let n=file.read(&mut buf).map_err(|e|e.to_string())?;if n==0{if total==0{let cipher=seam_e2e::encrypt(&key,&seam_e2e::chunk_nonce(&prefix,0),&[],&seam_e2e_protocol::aad(&id,0,0))?;stream.write_all(&cipher).map_err(|e|e.to_string())?}break}let cipher=seam_e2e::encrypt(&key,&seam_e2e::chunk_nonce(&prefix,index),&buf[..n],&seam_e2e_protocol::aad(&id,index,n))?;stream.write_all(&cipher).map_err(|e|e.to_string())?;sent+=n as u64;index+=1;let _=app.emit("transfer-progress",TransferProgress{id:id.clone(),name:name.clone(),sent,total,progress:((sent*100)/total.max(1)) as u8,state:"sending".into()});}let mut response=[0u8;512];let n=stream.read(&mut response).unwrap_or(0);let response=String::from_utf8_lossy(&response[..n]);if response.contains(" 422 "){let _=app.emit("transfer-progress",TransferProgress{id:id.clone(),name:name.clone(),sent,total,progress:100,state:"verification-failed".into()});return Err("E2E/checksum verification failed".into())}if !response.contains(" 201 "){return Err("Receiver did not verify transfer".into())}let _=app.emit("transfer-progress",TransferProgress{id,name,sent:total,total,progress:100,state:"verified".into()});Ok(())}
-fn setup_tray(app:&mut tauri::App)->Result<(),Box<dyn std::error::Error>>{let open=MenuItemBuilder::with_id("open","Open SEAM Share").build(app)?;let send_file=MenuItemBuilder::with_id("send-file","Send File").build(app)?;let send_text=MenuItemBuilder::with_id("send-text","Send Text").build(app)?;let settings=MenuItemBuilder::with_id("settings","Settings").build(app)?;let exit=MenuItemBuilder::with_id("exit","Exit").build(app)?;let menu=MenuBuilder::new(app).items(&[&open,&send_file,&send_text,&settings,&exit]).build()?;TrayIconBuilder::new().menu(&menu).tooltip("SEAM Share").show_menu_on_left_click(true).on_menu_event(|app,event|match event.id().as_ref(){"open"=>{if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.unminimize();let _=w.set_focus()}},"send-file"=>{let _=app.emit("tray-action","send-file");if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.set_focus()}},"send-text"=>{let _=app.emit("tray-action","send-text");if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.set_focus()}},"settings"=>{let _=app.emit("tray-action","settings");if let Some(w)=app.get_webview_window("main"){let _=w.show();let _=w.set_focus()}},"exit"=>app.exit(0),_=>{}}).on_tray_icon_event(|tray,event|{if let TrayIconEvent::Click{button:MouseButton::Left,button_state:MouseButtonState::Up,..}=event{if let Some(w)=tray.app_handle().get_webview_window("main"){let _=w.show();let _=w.unminimize();let _=w.set_focus()}}}).build(app)?;Ok(())}
-#[cfg_attr(mobile,tauri::mobile_entry_point)] pub fn run(){let settings=load_settings();let receive_dir=settings.receive_dir.map(PathBuf::from).unwrap_or_else(default_receive_dir);let _=fs::create_dir_all(&receive_dir);let state=AppState{device_id:make_id(),device_name:"This PC".into(),token:make_id(),paired:Arc::new(Mutex::new(settings.paired)),cancel:Arc::new(Mutex::new(Vec::new())),receive_dir:Arc::new(Mutex::new(receive_dir)),pending:Arc::new(Mutex::new(HashMap::new())),pending_e2e:Arc::new(Mutex::new(HashMap::new()))};let d=state.device_name.clone();thread::spawn(move||run_discovery_responder(d));tauri::Builder::default().plugin(tauri_plugin_dialog::init()).manage(state.clone()).on_window_event(|window,event|{if let WindowEvent::CloseRequested{api,..}=event{api.prevent_close();let _=window.hide()}}).setup(move|app|{setup_tray(app)?;let h=app.handle().clone();let s=state.clone();thread::spawn(move||transfer_server(s,h));let h2=app.handle().clone();let s2=state.clone();thread::spawn(move||auto_discovery(h2,s2));Ok(())}).invoke_handler(tauri::generate_handler![network_info,discover_devices,pairing_info,paired_devices,send_file,cancel_transfer,receive_directory,set_receive_directory,list_files,approve_incoming]).run(tauri::generate_context!()).expect("error while running Tauri application")}
+
+const DISCOVERY_PORT: u16 = 38947;
+const TRANSFER_PORT: u16 = 38948;
+const MAGIC: &str = "SEAM_SHARE_DISCOVER_V2";
+const CHUNK: usize = 256 * 1024;
+
+#[derive(Debug, Serialize, Clone)]
+pub struct NetworkInfo { pub local_ip: String, pub discovery_port: u16, pub transfer_port: u16 }
+#[derive(Debug, Serialize, Clone)]
+pub struct NearbyDevice { pub name: String, pub ip: String, pub port: u16 }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PairRequest { pub device_id: String, pub device_name: String, pub ip: String, pub port: u16, pub token: String }
+#[derive(Debug, Serialize, Clone)]
+pub struct PairingInfo { pub device_id: String, pub device_name: String, pub ip: String, pub port: u16, pub token: String }
+#[derive(Debug, Serialize, Clone)]
+pub struct PairedDeviceInfo { pub device_id: String, pub name: String, pub ip: String, pub port: u16, pub token: String }
+#[derive(Debug, Serialize, Clone)]
+pub struct TransferProgress { pub id: String, pub name: String, pub sent: u64, pub total: u64, pub progress: u8, pub state: String }
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct IncomingTransfer {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub relative_path: String,
+    pub checksum_sha256: String,
+    #[serde(default)] pub e2e_version: Option<u32>,
+    #[serde(default)] pub sender_ephemeral_public_key: Option<String>,
+    #[serde(default)] pub nonce_prefix: Option<String>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PairedDevice { device_id: String, device_name: String, ip: String, port: u16, token: String }
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct Settings { receive_dir: Option<String>, #[serde(default)] paired: Vec<PairedDevice> }
+struct PendingE2e { key: [u8; 32], nonce_prefix: [u8; 4] }
+#[derive(Clone)]
+struct AppState {
+    device_id: String,
+    device_name: String,
+    token: String,
+    paired: Arc<Mutex<Vec<PairedDevice>>>,
+    cancel: Arc<Mutex<Vec<String>>>,
+    receive_dir: Arc<Mutex<PathBuf>>,
+    pending: Arc<Mutex<HashMap<String, Option<bool>>>>,
+    pending_e2e: Arc<Mutex<HashMap<String, PendingE2e>>>,
+}
+
+fn local_ip() -> Result<IpAddr, String> { local_ip_address::local_ip().map_err(|e| e.to_string()) }
+fn make_id() -> String { format!("seam-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()) }
+fn default_receive_dir() -> PathBuf {
+    let mut p = PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()));
+    p.push("Downloads"); p.push("SEAM Share"); p
+}
+fn settings_path() -> PathBuf {
+    let mut p = PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into()));
+    p.push("SEAM Share"); p.push("settings.json"); p
+}
+fn load_settings() -> Settings { fs::read_to_string(settings_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default() }
+fn save_settings(s: &Settings) -> Result<(), String> {
+    let p = settings_path();
+    if let Some(parent) = p.parent() { fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    fs::write(p, serde_json::to_string_pretty(s).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+fn save_receive_dir(p: &PathBuf) -> Result<(), String> { let mut s = load_settings(); s.receive_dir = Some(p.to_string_lossy().into_owned()); save_settings(&s) }
+fn persist_pairing(state: &AppState) -> Result<(), String> {
+    let mut s = load_settings();
+    s.paired = state.paired.lock().map_err(|_| "pairing state unavailable".to_string())?.clone();
+    save_settings(&s)
+}
+fn safe_segment(v: &str) -> String { v.chars().filter(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' ')).collect::<String>().trim().to_string() }
+fn safe_relative(v: &str) -> PathBuf {
+    v.replace('\\', "/").split('/').filter_map(|s| {
+        let x = safe_segment(s);
+        if x.is_empty() || x == "." || x == ".." { None } else { Some(x) }
+    }).collect()
+}
+fn header(h: &[(String, String)], k: &str) -> Option<String> { h.iter().find(|(a, _)| a == k).map(|(_, b)| b.clone()) }
+fn hex_encode(v: &[u8]) -> String { v.iter().map(|b| format!("{:02x}", b)).collect() }
+fn hex_decode(v: &str, size: usize) -> Result<Vec<u8>, String> {
+    if v.len() != size * 2 { return Err("invalid hex length".into()); }
+    let mut out = Vec::with_capacity(size);
+    for i in 0..size { out.push(u8::from_str_radix(&v[i * 2..i * 2 + 2], 16).map_err(|_| "invalid hex".to_string())?); }
+    Ok(out)
+}
+fn sha256_file(p: &Path) -> Result<String, String> {
+    let mut f = fs::File::open(p).map_err(|e| e.to_string())?;
+    let mut h = Sha256::new(); let mut b = [0u8; CHUNK];
+    loop { let n = f.read(&mut b).map_err(|e| e.to_string())?; if n == 0 { break; } h.update(&b[..n]); }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+#[command]
+fn network_info() -> Result<NetworkInfo, String> { Ok(NetworkInfo { local_ip: local_ip()?.to_string(), discovery_port: DISCOVERY_PORT, transfer_port: TRANSFER_PORT }) }
+#[command]
+fn pairing_info(state: tauri::State<AppState>) -> Result<PairingInfo, String> { Ok(PairingInfo { device_id: state.device_id.clone(), device_name: state.device_name.clone(), ip: local_ip()?.to_string(), port: TRANSFER_PORT, token: state.token.clone() }) }
+#[command]
+fn paired_devices(state: tauri::State<AppState>) -> Result<Vec<PairedDeviceInfo>, String> {
+    Ok(state.paired.lock().map_err(|_| "pairing state unavailable".to_string())?.iter().map(|p| PairedDeviceInfo { device_id: p.device_id.clone(), name: p.device_name.clone(), ip: p.ip.clone(), port: p.port, token: p.token.clone() }).collect())
+}
+#[command]
+fn receive_directory(state: tauri::State<AppState>) -> Result<String, String> { Ok(state.receive_dir.lock().map_err(|_| "settings unavailable".to_string())?.to_string_lossy().into_owned()) }
+#[command]
+fn set_receive_directory(path: String, state: tauri::State<AppState>) -> Result<String, String> {
+    let p = PathBuf::from(path);
+    if !p.is_absolute() { return Err("Please choose an absolute folder path".into()); }
+    fs::create_dir_all(&p).map_err(|e| e.to_string())?; save_receive_dir(&p)?;
+    *state.receive_dir.lock().map_err(|_| "settings unavailable".to_string())? = p.clone();
+    Ok(p.to_string_lossy().into_owned())
+}
+#[command]
+fn discover_devices(device_name: String, timeout_ms: u64) -> Result<Vec<NearbyDevice>, String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| e.to_string())?;
+    socket.set_broadcast(true).map_err(|e| e.to_string())?;
+    socket.set_read_timeout(Some(Duration::from_millis(150))).map_err(|e| e.to_string())?;
+    let msg = format!("{}|{}|{}", MAGIC, device_name, TRANSFER_PORT);
+    socket.send_to(msg.as_bytes(), (Ipv4Addr::BROADCAST, DISCOVERY_PORT)).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(300, 3000));
+    let mut found = Vec::new(); let mut buf = [0u8; 1024];
+    while Instant::now() < deadline {
+        if let Ok((len, addr)) = socket.recv_from(&mut buf) {
+            let text = String::from_utf8_lossy(&buf[..len]).to_string();
+            let p: Vec<&str> = text.split('|').collect();
+            if p.len() == 3 && p[0] == MAGIC { if let Ok(port) = p[2].parse() { found.push(NearbyDevice { name: p[1].into(), ip: addr.ip().to_string(), port }); } }
+        }
+    }
+    found.sort_by(|a, b| a.ip.cmp(&b.ip)); found.dedup_by(|a, b| a.ip == b.ip); Ok(found)
+}
+fn run_discovery_responder(name: String) {
+    if let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT)) {
+        let mut buf = [0u8; 1024];
+        loop {
+            if let Ok((len, addr)) = socket.recv_from(&mut buf) {
+                let text = String::from_utf8_lossy(&buf[..len]).to_string();
+                let p: Vec<&str> = text.split('|').collect();
+                if p.len() >= 3 && p[0] == MAGIC { let reply = format!("{}|{}|{}", MAGIC, name, TRANSFER_PORT); let _ = socket.send_to(reply.as_bytes(), addr); }
+            }
+        }
+    }
+}
+fn auto_discovery(app: AppHandle, state: AppState) {
+    loop {
+        thread::sleep(Duration::from_secs(5));
+        let devices = discover_devices(state.device_name.clone(), 900).unwrap_or_default();
+        if let Ok(mut paired) = state.paired.lock() {
+            let mut changed = false;
+            for d in devices {
+                if let Some(p) = paired.iter_mut().find(|p| p.device_name == d.name) {
+                    if p.ip != d.ip || p.port != d.port { p.ip = d.ip; p.port = d.port; changed = true; }
+                }
+            }
+            if changed {
+                drop(paired);
+                let _ = persist_pairing(&state);
+                if let Ok(paired) = state.paired.lock() {
+                    let out: Vec<PairedDeviceInfo> = paired.iter().map(|p| PairedDeviceInfo { device_id: p.device_id.clone(), name: p.device_name.clone(), ip: p.ip.clone(), port: p.port, token: p.token.clone() }).collect();
+                    let _ = app.emit("paired-devices-updated", out);
+                }
+            }
+        }
+    }
+}
+fn read_headers(stream: &mut TcpStream) -> Result<(String, Vec<(String, String)>, Vec<u8>), String> {
+    let mut data = Vec::new(); let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 { return Err("connection closed".into()); }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let text = String::from_utf8_lossy(&data[..pos + 4]);
+            let mut lines = text.split("\r\n");
+            let request = lines.next().unwrap_or_default().to_string();
+            let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+            return Ok((request, headers, data[pos + 4..].to_vec()));
+        }
+        if data.len() > 64 * 1024 { return Err("headers too large".into()); }
+    }
+}
+fn respond(s: &mut TcpStream, code: u16, body: &str) {
+    let reason = match code { 200 => "OK", 201 => "Created", 400 => "Bad Request", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", 422 => "Unprocessable Entity", 500 => "Internal Server Error", _ => "Error" };
+    let _ = write!(s, "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", code, reason, body.len(), body);
+}
+fn wait_approval(state: &AppState, app: &AppHandle, req: IncomingTransfer) -> bool {
+    if let Ok(mut p) = state.pending.lock() { p.insert(req.id.clone(), None); }
+    let _ = app.emit("incoming-transfer", req.clone());
+    for _ in 0..240 {
+        thread::sleep(Duration::from_millis(500));
+        if let Ok(mut p) = state.pending.lock() {
+            if let Some(Some(v)) = p.get(&req.id) { let v = *v; p.remove(&req.id); return v; }
+        }
+    }
+    if let Ok(mut p) = state.pending.lock() { p.remove(&req.id); }
+    false
+}
+fn read_response(s: &mut TcpStream) -> Result<String, String> {
+    let mut data = Vec::new(); let mut b = [0u8; 4096];
+    for _ in 0..8 { let n = s.read(&mut b).map_err(|e| e.to_string())?; if n == 0 { break; } data.extend_from_slice(&b[..n]); if data.windows(4).any(|w| w == b"\r\n\r\n") { break; } }
+    Ok(String::from_utf8_lossy(&data).into_owned())
+}
+fn read_n(s: &mut TcpStream, initial: &mut Vec<u8>, n: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(n); let take = initial.len().min(n); out.extend_from_slice(&initial[..take]); initial.drain(..take);
+    while out.len() < n { let mut b = [0u8; 64 * 1024]; let want = (n - out.len()).min(b.len()); let got = s.read(&mut b[..want]).map_err(|e| e.to_string())?; if got == 0 { return Err("connection closed during transfer".into()); } out.extend_from_slice(&b[..got]); }
+    Ok(out)
+}
+fn transfer_server(state: AppState, app: AppHandle) {
+    let listener = match TcpListener::bind((Ipv4Addr::UNSPECIFIED, TRANSFER_PORT)) { Ok(v) => v, Err(_) => return };
+    for incoming in listener.incoming() {
+        if let Ok(mut stream) = incoming {
+            let s = state.clone(); let a = app.clone();
+            thread::spawn(move || {
+                let (request, headers, mut body) = match read_headers(&mut stream) { Ok(v) => v, Err(_) => return };
+                if header(&headers, "x-seam-token").unwrap_or_default() != s.token { respond(&mut stream, 401, ""); return; }
+
+                if request.starts_with("POST /pair ") {
+                    if let Ok(text) = String::from_utf8(body) {
+                        if let Ok(pair) = serde_json::from_str::<PairRequest>(&text) {
+                            if let Ok(mut list) = s.paired.lock() { list.retain(|p| p.device_id != pair.device_id); list.push(PairedDevice { device_id: pair.device_id, device_name: pair.device_name, ip: pair.ip, port: pair.port, token: pair.token }); }
+                            let _ = persist_pairing(&s); respond(&mut stream, 200, "{}"); return;
+                        }
+                    }
+                    respond(&mut stream, 400, ""); return;
+                }
+
+                if request.starts_with("POST /request ") {
+                    if let Ok(text) = String::from_utf8(body) {
+                        if let Ok(req) = serde_json::from_str::<IncomingTransfer>(&text) {
+                            let mut e2e_response = "{}".to_string();
+                            if req.e2e_version == Some(seam_e2e_protocol::VERSION) && req.sender_ephemeral_public_key.is_some() && req.nonce_prefix.is_some() {
+                                if let (Ok(peer), Ok(prefix)) = (hex_decode(req.sender_ephemeral_public_key.as_ref().unwrap(), 32), hex_decode(req.nonce_prefix.as_ref().unwrap(), 4)) {
+                                    let kp = seam_e2e::generate_keypair();
+                                    let peer_arr: [u8; 32] = peer.try_into().map_err(|_| ()).unwrap();
+                                    let key = seam_e2e::derive_shared_key(&kp.private_key, &peer_arr);
+                                    let prefix_arr: [u8; 4] = prefix.try_into().map_err(|_| ()).unwrap();
+                                    if let Ok(mut m) = s.pending_e2e.lock() { m.insert(req.id.clone(), PendingE2e { key, nonce_prefix: prefix_arr }); }
+                                    e2e_response = serde_json::json!({ "e2e_version": 1, "receiver_ephemeral_public_key": hex_encode(&kp.public_key) }).to_string();
+                                }
+                            }
+                            if wait_approval(&s, &a, req.clone()) { respond(&mut stream, 200, &e2e_response); }
+                            else { let _ = s.pending_e2e.lock().map(|mut m| m.remove(&req.id)); respond(&mut stream, 403, "DECLINED"); }
+                            return;
+                        }
+                    }
+                    respond(&mut stream, 400, ""); return;
+                }
+
+                if request.starts_with("POST /receive-e2e ") {
+                    let id = header(&headers, "x-seam-transfer-id").unwrap_or_default();
+                    let crypto = match s.pending_e2e.lock().ok().and_then(|mut m| m.remove(&id)) { Some(v) => v, None => { respond(&mut stream, 403, "missing e2e session"); return; } };
+                    let plain_size = match header(&headers, "x-plaintext-size").and_then(|v| v.parse::<u64>().ok()) { Some(v) => v, None => { respond(&mut stream, 400, "invalid plaintext size"); return; } };
+                    let encrypted_size = seam_e2e_protocol::ciphertext_size(plain_size);
+                    let content_length = header(&headers, "content-length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    if content_length != encrypted_size { respond(&mut stream, 400, "invalid encrypted size"); return; }
+                    let expected = header(&headers, "x-checksum-sha256").unwrap_or_default().to_ascii_lowercase();
+                    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) { respond(&mut stream, 400, "invalid checksum"); return; }
+                    let name = percent_decode(&header(&headers, "x-file-name").unwrap_or_else(|| "received-file".into()));
+                    let relative = header(&headers, "x-relative-path").map(|v| percent_decode(&v)).unwrap_or(name.clone());
+                    let mut path = s.receive_dir.lock().map(|p| p.clone()).unwrap_or_else(|_| default_receive_dir());
+                    let rel = safe_relative(&relative); path.push(&rel);
+                    if rel.components().count() == 0 { respond(&mut stream, 400, ""); return; }
+                    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+                    if let Ok(mut file) = fs::File::create(&path) {
+                        let mut hasher = Sha256::new(); let mut remaining = plain_size; let mut index = 0u64; let mut ok = true;
+                        while remaining > 0 || index == 0 {
+                            let plain_len = if remaining == 0 { 0 } else { std::cmp::min(CHUNK as u64, remaining) as usize };
+                            let cipher = match read_n(&mut stream, &mut body, plain_len + seam_e2e_protocol::TAG_SIZE) { Ok(v) => v, Err(_) => { ok = false; break; } };
+                            let nonce = seam_e2e::chunk_nonce(&crypto.nonce_prefix, index);
+                            let aad = seam_e2e_protocol::aad(&id, index, plain_len);
+                            match seam_e2e::decrypt(&crypto.key, &nonce, &cipher, &aad) {
+                                Ok(plain) => { if plain.len() != plain_len || file.write_all(&plain).is_err() { ok = false; break; } hasher.update(&plain); remaining -= plain_len as u64; }
+                                Err(_) => { ok = false; break; }
+                            }
+                            index += 1;
+                        }
+                        if !ok || remaining != 0 { let _ = fs::remove_file(&path); respond(&mut stream, 422, "E2E authentication failed"); return; }
+                        let actual = format!("{:x}", hasher.finalize());
+                        if actual != expected { let _ = fs::remove_file(&path); let _ = a.emit("transfer-verify-failed", serde_json::json!({ "name": name, "expected": expected, "actual": actual })); respond(&mut stream, 422, "checksum mismatch"); return; }
+                        let _ = a.emit("transfer-verified", serde_json::json!({ "name": name, "checksum": actual })); respond(&mut stream, 201, "VERIFIED"); return;
+                    }
+                    respond(&mut stream, 500, "unable to create output"); return;
+                }
+
+                if request.starts_with("POST /receive ") { respond(&mut stream, 400, "legacy plaintext receive disabled; use E2E"); return; }
+                respond(&mut stream, 404, "");
+            });
+        }
+    }
+}
+fn percent_decode(v: &str) -> String {
+    let mut out = Vec::with_capacity(v.len()); let b = v.as_bytes(); let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() { if let Ok(x) = u8::from_str_radix(&v[i + 1..i + 3], 16) { out.push(x); i += 3; continue; } }
+        if b[i] == b'+' { out.push(b' '); } else { out.push(b[i]); } i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+fn percent_encode(v: &str) -> String {
+    let mut s = String::new();
+    for b in v.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'_' | b'-' | b'/') { s.push(*b as char); }
+        else { use std::fmt::Write; write!(&mut s, "%{:02X}", b).ok(); }
+    }
+    s
+}
+#[command]
+fn approve_incoming(id: String, approved: bool, state: tauri::State<AppState>) -> Result<(), String> {
+    let mut p = state.pending.lock().map_err(|_| "approval state unavailable".to_string())?;
+    if let Some(v) = p.get_mut(&id) { *v = Some(approved); Ok(()) } else { Err("transfer request expired".into()) }
+}
+#[command]
+fn list_files(path: String) -> Result<Vec<(String, u64)>, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> std::io::Result<()> {
+        for e in fs::read_dir(dir)? { let e = e?; let p = e.path(); if p.is_dir() { walk(root, &p, out)?; } else if p.is_file() { if let Ok(rel) = p.strip_prefix(root) { out.push((rel.to_string_lossy().into_owned(), e.metadata()?.len())); } } }
+        Ok(())
+    }
+    let root = PathBuf::from(path); if !root.is_dir() { return Err("Not a folder".into()); }
+    let mut out = Vec::new(); walk(&root, &root, &mut out).map_err(|e| e.to_string())?; Ok(out)
+}
+#[command]
+fn cancel_transfer(id: String, state: tauri::State<AppState>) -> Result<(), String> { if let Ok(mut c) = state.cancel.lock() { if !c.contains(&id) { c.push(id); } } Ok(()) }
+#[command]
+fn send_file(app: AppHandle, state: tauri::State<AppState>, path: String, ip: String, port: u16, token: String, id: String, relative_path: Option<String>) -> Result<(), String> {
+    let total = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    let name = PathBuf::from(&path).file_name().and_then(|v| v.to_str()).unwrap_or("shared-file").to_string();
+    let rel = relative_path.unwrap_or_else(|| name.clone()); let checksum = sha256_file(Path::new(&path))?;
+    let sender = seam_e2e::generate_keypair(); let mut prefix = [0u8; 4]; getrandom::fill(&mut prefix).map_err(|e| e.to_string())?;
+    let addr = format!("{}:{}", ip, port); let mut stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?; stream.set_read_timeout(Some(Duration::from_secs(125))).ok();
+    let req = IncomingTransfer { id: id.clone(), name: name.clone(), size: total, relative_path: rel.clone(), checksum_sha256: checksum.clone(), e2e_version: Some(seam_e2e_protocol::VERSION), sender_ephemeral_public_key: Some(hex_encode(&sender.public_key)), nonce_prefix: Some(hex_encode(&prefix)) };
+    let body = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    let head = format!("POST /request HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nX-Seam-Token: {}\r\nConnection: close\r\n\r\n{}", addr, body.len(), token, body);
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?; let response = read_response(&mut stream)?;
+    if !response.contains(" 200 ") { return Err("Transfer declined".into()); }
+    let response_body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    let value: serde_json::Value = serde_json::from_str(response_body).map_err(|_| "Receiver returned invalid E2E response".to_string())?;
+    let receiver_pub = hex_decode(value.get("receiver_ephemeral_public_key").and_then(|v| v.as_str()).ok_or("Receiver did not return E2E key")?, 32)?;
+    let receiver_arr: [u8; 32] = receiver_pub.try_into().map_err(|_| "invalid receiver key")?;
+    let key = seam_e2e::derive_shared_key(&sender.private_key, &receiver_arr); drop(stream);
+    let mut stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
+    let encrypted_total = seam_e2e_protocol::ciphertext_size(total); let enc = percent_encode(&rel);
+    let head = format!("POST /receive-e2e HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nX-Seam-Token: {}\r\nX-Seam-Transfer-Id: {}\r\nX-File-Name: {}\r\nX-Relative-Path: {}\r\nX-Checksum-SHA256: {}\r\nX-Plaintext-Size: {}\r\nConnection: close\r\n\r\n", addr, encrypted_total, token, id, enc, enc, checksum, total);
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    let mut file = fs::File::open(&path).map_err(|e| e.to_string())?; let mut buf = [0u8; CHUNK]; let mut sent = 0u64; let mut index = 0u64;
+    loop {
+        if state.cancel.lock().map(|c| c.contains(&id)).unwrap_or(false) { let _ = app.emit("transfer-progress", TransferProgress { id: id.clone(), name: name.clone(), sent, total, progress: ((sent * 100) / total.max(1)) as u8, state: "cancelled".into() }); return Ok(()); }
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 { if total == 0 { let cipher = seam_e2e::encrypt(&key, &seam_e2e::chunk_nonce(&prefix, 0), &[], &seam_e2e_protocol::aad(&id, 0, 0))?; stream.write_all(&cipher).map_err(|e| e.to_string())?; } break; }
+        let cipher = seam_e2e::encrypt(&key, &seam_e2e::chunk_nonce(&prefix, index), &buf[..n], &seam_e2e_protocol::aad(&id, index, n))?;
+        stream.write_all(&cipher).map_err(|e| e.to_string())?; sent += n as u64; index += 1;
+        let _ = app.emit("transfer-progress", TransferProgress { id: id.clone(), name: name.clone(), sent, total, progress: ((sent * 100) / total.max(1)) as u8, state: "sending".into() });
+    }
+    let mut response = [0u8; 512]; let n = stream.read(&mut response).unwrap_or(0); let response = String::from_utf8_lossy(&response[..n]);
+    if response.contains(" 422 ") { let _ = app.emit("transfer-progress", TransferProgress { id: id.clone(), name: name.clone(), sent, total, progress: 100, state: "verification-failed".into() }); return Err("E2E/checksum verification failed".into()); }
+    if !response.contains(" 201 ") { return Err("Receiver did not verify transfer".into()); }
+    let _ = app.emit("transfer-progress", TransferProgress { id, name, sent: total, total, progress: 100, state: "verified".into() }); Ok(())
+}
+fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let open = MenuItemBuilder::with_id("open", "Open SEAM Share").build(app)?; let send_file = MenuItemBuilder::with_id("send-file", "Send File").build(app)?; let send_text = MenuItemBuilder::with_id("send-text", "Send Text").build(app)?; let settings = MenuItemBuilder::with_id("settings", "Settings").build(app)?; let exit = MenuItemBuilder::with_id("exit", "Exit").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&open, &send_file, &send_text, &settings, &exit]).build()?;
+    TrayIconBuilder::new().menu(&menu).tooltip("SEAM Share").show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => { if let Some(w) = app.get_webview_window("main") { let _ = w.show(); let _ = w.unminimize(); let _ = w.set_focus(); } },
+            "send-file" => { let _ = app.emit("tray-action", "send-file"); if let Some(w) = app.get_webview_window("main") { let _ = w.show(); let _ = w.set_focus(); } },
+            "send-text" => { let _ = app.emit("tray-action", "send-text"); if let Some(w) = app.get_webview_window("main") { let _ = w.show(); let _ = w.set_focus(); } },
+            "settings" => { let _ = app.emit("tray-action", "settings"); if let Some(w) = app.get_webview_window("main") { let _ = w.show(); let _ = w.set_focus(); } },
+            "exit" => app.exit(0), _ => {}
+        })
+        .on_tray_icon_event(|tray, event| { if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event { if let Some(w) = tray.app_handle().get_webview_window("main") { let _ = w.show(); let _ = w.unminimize(); let _ = w.set_focus(); } } })
+        .build(app)?; Ok(())
+}
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let settings = load_settings(); let receive_dir = settings.receive_dir.map(PathBuf::from).unwrap_or_else(default_receive_dir); let _ = fs::create_dir_all(&receive_dir);
+    let state = AppState { device_id: make_id(), device_name: "This PC".into(), token: make_id(), paired: Arc::new(Mutex::new(settings.paired)), cancel: Arc::new(Mutex::new(Vec::new())), receive_dir: Arc::new(Mutex::new(receive_dir)), pending: Arc::new(Mutex::new(HashMap::new())), pending_e2e: Arc::new(Mutex::new(HashMap::new())) };
+    let d = state.device_name.clone(); thread::spawn(move || run_discovery_responder(d));
+    tauri::Builder::default().plugin(tauri_plugin_dialog::init()).manage(state.clone())
+        .on_window_event(|window, event| { if let WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); let _ = window.hide(); } })
+        .setup(move |app| { setup_tray(app)?; let h = app.handle().clone(); let s = state.clone(); thread::spawn(move || transfer_server(s, h)); let h2 = app.handle().clone(); let s2 = state.clone(); thread::spawn(move || auto_discovery(h2, s2)); Ok(()) })
+        .invoke_handler(tauri::generate_handler![network_info, discover_devices, pairing_info, paired_devices, send_file, cancel_transfer, receive_directory, set_receive_directory, list_files, approve_incoming])
+        .run(tauri::generate_context!()).expect("error while running Tauri application");
+}
