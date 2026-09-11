@@ -26,6 +26,13 @@ pub fn derive_shared_key(private_key: &[u8; 32], peer_public_key: &[u8; 32]) -> 
     out
 }
 
+pub fn chunk_nonce(prefix: &[u8; 4], index: u64) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[..4].copy_from_slice(prefix);
+    out[4..].copy_from_slice(&index.to_be_bytes());
+    out
+}
+
 pub fn encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
     ChaCha20Poly1305::new(key.into())
         .encrypt(Nonce::from_slice(nonce), chacha20poly1305::aead::Payload { msg: plaintext, aad })
@@ -76,5 +83,10 @@ mod tests {
         let mut ciphertext = encrypt(&key, &nonce, b"hello", aad).unwrap();
         ciphertext[0] ^= 1;
         assert!(decrypt(&key, &nonce, &ciphertext, aad).is_err());
+    }
+
+    #[test]
+    fn nonce_uses_big_endian_chunk_index() {
+        assert_eq!(chunk_nonce(&[0x10, 0x20, 0x30, 0x40], 2), [0x10,0x20,0x30,0x40,0,0,0,0,0,0,0,2]);
     }
 }
